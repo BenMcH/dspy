@@ -2,7 +2,7 @@ import logging
 from typing import TYPE_CHECKING, Any, get_origin
 
 import json_repair
-import litellm
+import litellm.utils
 
 from dspy.adapters.types import History, Type
 from dspy.adapters.types.base_type import split_message_content_for_custom_types
@@ -83,7 +83,8 @@ class Adapter:
                     "input field with type `list[dspy.Tool]`."
                 )
 
-            if tool_call_output_field_name and litellm.supports_function_calling(model=lm.model):
+            if tool_call_output_field_name and litellm.utils.supports_function_calling(model=lm.model):
+                assert tool_call_input_field_name is not None
                 tools = inputs[tool_call_input_field_name]
                 tools = tools if isinstance(tools, list) else [tools]
 
@@ -133,7 +134,7 @@ class Adapter:
                 output_logprobs = output.get("logprobs")
                 tool_calls = output.get("tool_calls")
 
-            if text:
+            if text and isinstance(text, str):
                 value = self.parse(processed_signature, text)
                 for field_name in original_signature.output_fields.keys():
                     if field_name not in value:
@@ -197,9 +198,9 @@ class Adapter:
             signature's output field names. For multiple generations (n > 1), returns multiple dictionaries.
         """
         processed_signature = self._call_preprocess(lm, lm_kwargs, signature, inputs)
-        inputs = self.format(processed_signature, demos, inputs)
+        formatted_inputs = self.format(processed_signature, demos, inputs)
 
-        outputs = lm(messages=inputs, **lm_kwargs)
+        outputs = lm(messages=formatted_inputs, **lm_kwargs)
         return self._call_postprocess(processed_signature, signature, outputs, lm, lm_kwargs)
 
     async def acall(
@@ -211,9 +212,9 @@ class Adapter:
         inputs: dict[str, Any],
     ) -> list[dict[str, Any]]:
         processed_signature = self._call_preprocess(lm, lm_kwargs, signature, inputs)
-        inputs = self.format(processed_signature, demos, inputs)
+        formatted_inputs = self.format(processed_signature, demos, inputs)
 
-        outputs = await lm.acall(messages=inputs, **lm_kwargs)
+        outputs = await lm.acall(messages=formatted_inputs, **lm_kwargs)
         return self._call_postprocess(processed_signature, signature, outputs, lm, lm_kwargs)
 
     def format(
@@ -263,6 +264,11 @@ class Adapter:
         """
         inputs_copy = dict(inputs)
 
+        messages = []
+        system_message = self.format_system_message(signature)
+        messages.append({"role": "system", "content": system_message})
+        messages.extend(self.format_demos(signature, demos))
+
         # If the signature and inputs have conversation history, we need to format the conversation history and
         # remove the history field from the signature.
         history_field_name = self._get_history_field_name(signature)
@@ -275,11 +281,6 @@ class Adapter:
                 inputs_copy,
             )
 
-        messages = []
-        system_message = self.format_system_message(signature)
-        messages.append({"role": "system", "content": system_message})
-        messages.extend(self.format_demos(signature, demos))
-        if history_field_name:
             # Conversation history and current input
             content = self.format_user_message_content(signature_without_history, inputs_copy, main_request=True)
             messages.extend(conversation_history)
@@ -452,23 +453,23 @@ class Adapter:
 
         return messages
 
-    def _get_history_field_name(self, signature: type[Signature]) -> bool:
+    def _get_history_field_name(self, signature: type[Signature]) -> str | None:
         for name, field in signature.input_fields.items():
             if field.annotation == History:
                 return name
         return None
 
-    def _get_tool_call_input_field_name(self, signature: type[Signature]) -> bool:
+    def _get_tool_call_input_field_name(self, signature: type[Signature]) -> str | None:
         for name, field in signature.input_fields.items():
             # Look for annotation `list[dspy.Tool]` or `dspy.Tool`
             origin = get_origin(field.annotation)
-            if origin is list and field.annotation.__args__[0] == Tool:
+            if origin is list and field.annotation and field.annotation.__args__[0] == Tool:
                 return name
             if field.annotation == Tool:
                 return name
         return None
 
-    def _get_tool_call_output_field_name(self, signature: type[Signature]) -> bool:
+    def _get_tool_call_output_field_name(self, signature: type[Signature]) -> str | None:
         for name, field in signature.output_fields.items():
             if field.annotation == ToolCalls:
                 return name

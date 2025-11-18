@@ -3,11 +3,11 @@ import inspect
 import logging
 import uuid
 from contextvars import ContextVar
-from typing import Any, Callable
+from typing import Any, Callable, Coroutine, ParamSpec, TypeVar
 
 import dspy
 
-ACTIVE_CALL_ID = ContextVar("active_call_id", default=None)
+ACTIVE_CALL_ID: ContextVar[str | None] = ContextVar("active_call_id", default=None)
 
 logger = logging.getLogger(__name__)
 
@@ -255,7 +255,11 @@ class BaseCallback:
         pass
 
 
-def with_callbacks(fn):
+
+P = ParamSpec("P")
+T = TypeVar("T")
+
+def with_callbacks(fn: Callable[P, T]) -> Callable[P, T] | Callable[P, Coroutine[Any, Any, T]]:
     """Decorator to add callback functionality to instance methods."""
 
     def _execute_start_callbacks(instance, fn, call_id, callbacks, args, kwargs):
@@ -285,7 +289,7 @@ def with_callbacks(fn):
 
     def _get_active_callbacks(instance):
         """Get combined global and instance-level callbacks."""
-        return dspy.settings.get("callbacks", []) + getattr(instance, "callbacks", [])
+        return (dspy.settings.get("callbacks") or []) + getattr(instance, "callbacks", [])
 
     if inspect.iscoroutinefunction(fn):
 
