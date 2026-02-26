@@ -1,0 +1,741 @@
+# DSPy: Programming Language Models
+
+DSPy is a framework for **programming—rather than prompting—language models**. It provides a declarative way to build modular, composable AI programs that can be automatically optimized.
+
+> GitHub: https://github.com/stanfordnlp/dspy  
+> Docs: https://dspy.ai  
+> Install: `pip install dspy`
+
+## Core Concept
+
+DSPy separates *what* a module should do (Signatures) from *how* it does it (Modules), then automatically optimizes the prompts and/or model weights using Optimizers (teleprompters). Programs are written in Python; DSPy handles the prompt engineering.
+
+```python
+import dspy
+
+dspy.configure(lm=dspy.LM("openai/gpt-4o-mini"))
+
+class QA(dspy.Module):
+    def __init__(self):
+        self.predict = dspy.ChainOfThought("question -> answer")
+
+    def forward(self, question):
+        return self.predict(question=question)
+
+qa = QA()
+result = qa(question="What is the capital of France?")
+print(result.answer)  # "Paris"
+```
+
+---
+
+## Signatures
+
+Signatures declaratively specify input/output behavior. They are the *interface* of a DSPy module.
+
+### Inline Syntax
+```python
+"question -> answer"
+"question, context: list[str] -> answer: str"
+"text -> label: bool, confidence: float"
+```
+
+### Class-Based Syntax
+```python
+class Summarize(dspy.Signature):
+    """Summarize the text in a single sentence."""
+    text: str = dspy.InputField(desc="Text to summarize")
+    summary: str = dspy.OutputField(desc="One-sentence summary")
+```
+
+### Field Types
+Supported: `str` (default), `int`, `float`, `bool`, `list[T]`, `dict[K,V]`, `dspy.Image`, `dspy.Audio`, Pydantic models
+
+### Key APIs
+```python
+dspy.InputField(desc="...", prefix="...")
+dspy.OutputField(desc="...", prefix="...")
+sig.with_instructions("Be concise.")
+sig.with_updated_fields(answer=list[str])
+sig.append(name, field) / sig.prepend(name, field) / sig.delete(name)
+```
+
+---
+
+## Language Models
+
+### Configuration
+```python
+lm = dspy.LM(
+    "openai/gpt-4o-mini",     # Any LiteLLM-supported model string
+    temperature=0.7,
+    max_tokens=2000,
+    cache=True,               # Default: caching enabled
+    num_retries=3
+)
+dspy.configure(lm=lm)
+```
+
+### Supported Providers
+- **OpenAI**: `openai/gpt-4o`, `openai/gpt-4o-mini`
+- **OpenAI Responses API**: `openai/gpt-5` with `model_type="responses"`
+- **Anthropic**: `anthropic/claude-3-5-sonnet-20241022`
+- **Google**: `gemini/gemini-2.5-flash`, `vertex_ai/gemini-2.0-flash`
+- **Local (Ollama)**: `ollama_chat/llama3.2`
+- **SGLang/vLLM**: `openai/local-model` with `api_base="http://localhost:8000/v1"`
+- **Databricks**: `databricks/databricks-meta-llama-3-1-70b-instruct`
+- **Any OpenAI-compatible**: `openai/your-model` with `api_base=...`
+
+### Context and Per-Module Overrides
+```python
+# Temporary override (thread-safe)
+with dspy.context(lm=other_lm):
+    result = module(...)
+
+# Module-specific override
+module.set_lm(dspy.LM("anthropic/claude-3-5-haiku"))
+```
+
+### Caching
+- Enabled by default — same inputs always return same outputs
+- Bypass: `lm("prompt", rollout_id=1, temperature=1.0)` (different `rollout_id` = cache miss)
+- Disable: `dspy.LM(..., cache=False)`
+- Configure: `dspy.configure_cache(enable_disk_cache=True)`
+
+### Token Usage
+```python
+dspy.configure(lm=lm, track_usage=True)
+result = module(question="...")
+usage = result.get_lm_usage()
+# {"openai/gpt-4o-mini": {"total_tokens": 321, "prompt_tokens": 260, "completion_tokens": 61}}
+```
+
+### Embeddings
+```python
+embedder = dspy.Embedder("openai/text-embedding-3-small", batch_size=512)
+vectors = embedder(["text1", "text2"])  # Returns numpy array
+```
+
+---
+
+## Modules
+
+All DSPy modules inherit from `dspy.Module`. Call with `module(field=value)`.
+
+### dspy.Predict
+Foundation module. Maps inputs to outputs.
+```python
+predict = dspy.Predict("question -> answer")
+result = predict(question="What is 2+2?")
+print(result.answer)
+
+# Multiple completions
+predict = dspy.Predict("question -> answer", n=5, temperature=0.9)
+print(predict(question="...").completions.answer)  # list of 5
+```
+
+### dspy.ChainOfThought
+Adds a `reasoning` field before outputs (step-by-step thinking).
+```python
+cot = dspy.ChainOfThought("question -> answer")
+result = cot(question="If a train...")
+print(result.reasoning)  # Step-by-step reasoning
+print(result.answer)
+```
+
+### dspy.ReAct
+Reasoning + Acting agent. Iteratively selects and executes tools.
+```python
+def search(query: str) -> str:
+    """Search Wikipedia."""
+    ...
+
+react = dspy.ReAct("question -> answer", tools=[search], max_iters=10)
+result = react(question="Who invented the telephone?")
+```
+
+### dspy.ProgramOfThought
+Generates and executes Python code to solve problems.
+```python
+pot = dspy.ProgramOfThought("question -> answer: float")
+result = pot(question="What is P(sum=7) when rolling two dice?")
+# Generates, executes code, returns result
+```
+
+### dspy.MultiChainComparison
+Runs ChainOfThought N times independently, selects best via LM comparison.
+```python
+mcc = dspy.MultiChainComparison("question -> answer", num_chains=5)
+result = mcc(question="Explain quantum entanglement")
+```
+
+### dspy.BestOfN
+Samples module up to N times, returns first passing `threshold` or highest scoring.
+```python
+def one_word(args, pred) -> float:
+    return 1.0 if len(pred.answer.split()) == 1 else 0.0
+
+best = dspy.BestOfN(
+    module=dspy.ChainOfThought("question -> answer"),
+    N=3,
+    reward_fn=one_word,
+    threshold=1.0
+)
+result = best(question="Capital of France?")  # "Paris"
+```
+
+### dspy.Refine
+Like BestOfN but generates LM feedback on each failure and passes it as hints.
+```python
+refine = dspy.Refine(
+    module=dspy.ChainOfThought("question -> answer"),
+    N=3,
+    reward_fn=one_word,
+    threshold=1.0
+)
+```
+
+### dspy.Parallel
+Runs multiple modules concurrently.
+```python
+parallel = dspy.Parallel([
+    dspy.ChainOfThought("q -> a"),
+    dspy.ProgramOfThought("q -> a"),
+])
+results = parallel(q="...")  # Both run simultaneously
+```
+
+### dspy.CodeAct
+Generates and executes Python code using provided tool functions.
+```python
+def factorial(n: int) -> int:
+    """Compute n factorial."""
+    return 1 if n == 1 else n * factorial(n-1)
+
+act = dspy.CodeAct("n -> result: int", tools=[factorial])
+result = act(n=5)  # result.result == 120
+```
+**Constraints**: Plain functions only (no callable classes); Python stdlib only; all dependencies in tools list.
+
+### dspy.RLM (Recursive Language Model) — Experimental
+Solves large-context tasks by letting the LLM programmatically explore context via a sandboxed REPL. Addresses "context rot" by separating variable space from token space.
+
+```python
+rlm = dspy.RLM(
+    "document, question -> answer",
+    max_iterations=20,    # REPL loop limit
+    max_llm_calls=50,     # Sub-LLM call budget
+    sub_lm=cheap_lm,      # Cheaper model for sub-queries
+    tools=[custom_fn]     # Additional tools in REPL
+)
+
+result = rlm(document=very_long_text, question="What is the total revenue?")
+print(result.answer)
+print(result.trajectory)  # List of {reasoning, code, output} per step
+```
+
+**How it works**:
+1. LLM receives metadata about inputs (type, length, preview) — not full context
+2. LLM writes Python code to explore data (`print`, regex, slicing, etc.)
+3. Code executes in Deno/Pyodide WASM sandbox
+4. LLM iterates, calling `llm_query(snippet)` for semantic sub-analysis
+5. LLM calls `SUBMIT(answer=...)` when done
+
+**Built-in REPL tools**: `llm_query(prompt)`, `llm_query_batched(prompts)`, `SUBMIT(**kwargs)`, `print()`, standard library
+
+**Requires**: [Deno](https://deno.land/) installed (`curl -fsSL https://deno.land/install.sh | sh`)
+
+**Thread safety**: Not thread-safe with custom interpreters; use default `PythonInterpreter` or separate instances.
+
+```python
+# Cheaper sub-LM pattern
+rlm = dspy.RLM("data, query -> summary",
+               sub_lm=dspy.LM("openai/gpt-4o-mini"))
+
+# Multiple typed outputs
+rlm = dspy.RLM("logs -> error_count: int, critical_errors: list[str]")
+
+# Custom tools
+rlm = dspy.RLM("documents, query -> answer", tools=[fetch_metadata])
+
+# Async
+result = await rlm.aforward(context=data, query="...")
+```
+
+### Building Custom Modules
+```python
+class MultiHopQA(dspy.Module):
+    def __init__(self, num_hops=3):
+        self.num_hops = num_hops
+        self.generate_query = dspy.ChainOfThought("question, context -> search_query")
+        self.generate_answer = dspy.ChainOfThought("question, context -> answer")
+
+    def forward(self, question: str) -> dspy.Prediction:
+        context = ""
+        for _ in range(self.num_hops):
+            q = self.generate_query(question=question, context=context).search_query
+            context += search(q)
+        return self.generate_answer(question=question, context=context)
+```
+
+### Module APIs
+```python
+module.set_lm(lm) / module.get_lm()
+module.named_predictors()       # dict of all Predict instances
+module.save("path.json") / module.load("path.json")
+module.dump_state() / module.load_state(state_dict)
+module.batch(examples, num_threads=10)
+module.inspect_history(n=3)
+module.deepcopy() / module.reset_copy()
+await module.acall(**kwargs)    # Async execution
+```
+
+---
+
+## Optimizers (Teleprompters)
+
+Optimizers automatically improve DSPy programs by tuning prompt instructions, few-shot demos, and/or model weights.
+
+### Quick Start
+```python
+optimizer = dspy.MIPROv2(metric=my_metric, auto="medium")
+optimized = optimizer.compile(program, trainset=trainset)
+optimized.save("optimized.json")
+```
+
+### Metric Function
+```python
+def metric(example: dspy.Example, pred: dspy.Prediction, trace=None) -> float:
+    return 1.0 if pred.answer == example.answer else 0.0
+    # trace is not None during optimization (used for stricter checking)
+```
+
+### Data Splits
+Use **smaller training sets** (~20-50 examples) and larger validation sets (opposite of standard ML).
+```python
+trainset = data[:50]
+valset = data[50:300]
+```
+
+### dspy.LabeledFewShot
+Static few-shot from labeled examples. No metric needed.
+```python
+optimizer = dspy.LabeledFewShot(k=16)
+optimized = optimizer.compile(student, trainset=trainset)
+```
+
+### dspy.BootstrapFewShot
+Generates + validates demonstrations via teacher execution.
+```python
+optimizer = dspy.BootstrapFewShot(
+    metric=metric,
+    max_bootstrapped_demos=4,
+    max_labeled_demos=16,
+    max_rounds=1
+)
+optimized = optimizer.compile(student, trainset=trainset)
+```
+
+### dspy.BootstrapFewShotWithRandomSearch
+Runs N random seeds, evaluates candidates, returns best.
+```python
+optimizer = dspy.BootstrapFewShotWithRandomSearch(
+    metric=metric,
+    num_candidate_programs=16,
+    max_bootstrapped_demos=4
+)
+optimized = optimizer.compile(student, trainset=trainset, valset=valset)
+```
+
+### dspy.KNNFewShot
+Dynamic per-inference nearest-neighbor demo retrieval.
+```python
+optimizer = dspy.KNNFewShot(k=3, trainset=trainset,
+                             vectorizer=dspy.Embedder("openai/text-embedding-3-small"))
+optimized = optimizer.compile(student)
+```
+
+### dspy.COPRO
+Hill-climbing instruction optimization.
+```python
+optimizer = dspy.COPRO(metric=metric, breadth=10, depth=3)
+optimized = optimizer.compile(program, trainset=trainset)
+```
+
+### dspy.MIPROv2 ⭐ (recommended)
+Joint Bayesian optimization of instructions + few-shot demos. Most powerful general-purpose optimizer.
+```python
+optimizer = dspy.MIPROv2(
+    metric=metric,
+    auto="light",     # "light" (6 trials), "medium" (12), "heavy" (18)
+    num_threads=None,
+    prompt_model=None,
+    task_model=None
+)
+optimized = optimizer.compile(student, trainset=trainset, valset=valset)
+
+# Zero-shot (no demos, instructions only)
+optimizer = dspy.MIPROv2(metric=metric, auto="light",
+                          max_bootstrapped_demos=0, max_labeled_demos=0)
+```
+
+### dspy.SIMBA
+Mini-batch stochastic ascent with rule generation.
+```python
+optimizer = dspy.SIMBA(metric=metric, bsize=32, num_candidates=6, max_steps=8)
+optimized = optimizer.compile(student, trainset=trainset)
+```
+
+### dspy.GEPA
+Genetic-Pareto optimizer with LLM reflection feedback. Requires metric returning `(score, feedback)`.
+```python
+def gepa_metric(example, output, trace):
+    score = 1.0 if output.answer == example.answer else 0.0
+    return dspy.Prediction(score=score, feedback=f"Expected: {example.answer}")
+
+optimizer = dspy.GEPA(metric=gepa_metric, auto="light")
+optimized = optimizer.compile(student, trainset=trainset, valset=valset)
+```
+
+### dspy.InferRules
+Discovers natural language rules from demos, appends to instructions.
+```python
+optimizer = dspy.InferRules(num_candidates=10, num_rules=10)
+optimized = optimizer.compile(student, trainset=trainset)
+```
+
+### dspy.BootstrapFinetune
+Fine-tunes model weights (requires LM with fine-tuning support).
+```python
+student.set_lm(dspy.LM("openai/gpt-4o-mini"))
+optimizer = dspy.BootstrapFinetune(metric=metric, multitask=True)
+optimized = optimizer.compile(student, trainset=trainset)
+```
+
+### dspy.BetterTogether
+Chains prompt + weight optimization.
+```python
+optimizer = dspy.BetterTogether(
+    metric=metric,
+    p=dspy.MIPROv2(metric=metric),
+    w=dspy.BootstrapFinetune(metric=metric)
+)
+optimized = optimizer.compile(student, trainset=trainset, strategy="p -> w -> p")
+```
+
+### dspy.Ensemble
+Combines multiple programs.
+```python
+optimizer = dspy.Ensemble(reduce_fn=dspy.majority, size=3)
+ensemble = optimizer.compile([prog1, prog2, prog3])
+```
+
+### Optimizer Selection Guide
+| Examples | Optimizer |
+|---|---|
+| ~10 labeled | `LabeledFewShot` |
+| 10-50 | `BootstrapFewShot` |
+| 50-200 | `BootstrapFewShotWithRandomSearch` |
+| 200+, best results | `MIPROv2(auto="medium")` |
+| Instructions only | `MIPROv2(max_*_demos=0)` or `COPRO` |
+| Rich feedback | `GEPA` |
+| Want interpretable rules | `InferRules` or `SIMBA` |
+| Multiple programs | `Ensemble` |
+| Prompt + weight | `BetterTogether` |
+
+**Typical cost**: $2–$20 USD for MIPROv2, depending on LM size and dataset.
+
+---
+
+## Evaluation
+
+```python
+# Define metric
+def metric(example, pred, trace=None):
+    return pred.answer.lower() == example.answer.lower()
+
+# Run evaluation
+evaluator = dspy.Evaluate(devset=devset, num_threads=4, display_progress=True)
+score = evaluator(program, metric=metric)
+
+# Built-in metrics
+dspy.evaluate.answer_exact_match(example, pred)     # bool
+dspy.evaluate.answer_passage_match(example, pred)   # bool
+dspy.evaluate.SemanticF1()(example, pred)           # float (LM-based)
+dspy.evaluate.CompleteAndGrounded()(example, pred)  # float (LM-based)
+```
+
+---
+
+## Primitives
+
+### dspy.Example
+```python
+ex = dspy.Example(question="...", answer="...").with_inputs("question")
+ex.inputs()     # Only input fields
+ex.labels()     # Only output fields
+ex.toDict()
+```
+
+### dspy.Prediction
+```python
+pred = module(question="...")
+pred.answer               # Output field value
+pred.get_lm_usage()       # Token counts per model
+pred.completions.answer   # List when n>1
+```
+
+### dspy.Image / dspy.Audio
+```python
+img = dspy.Image.from_file("img.jpg") | dspy.Image.from_url("...")
+audio = dspy.Audio.from_file("audio.mp3")
+```
+
+### dspy.History
+```python
+history = dspy.History(messages=[...])  # Multi-turn conversation context
+```
+
+### dspy.Tool
+```python
+tool = dspy.Tool(my_function)
+tool = dspy.Tool.from_langchain(lc_tool)
+tool = dspy.Tool.from_mcp_tool(session, mcp_tool)
+result = tool(param=value)
+result = await tool.acall(param=value)
+```
+
+---
+
+## Adapters
+
+Adapters control how signatures are formatted for LM APIs.
+
+```python
+dspy.configure(lm=lm, adapter=dspy.ChatAdapter())    # Default; chat format
+dspy.configure(lm=lm, adapter=dspy.JSONAdapter())    # JSON-structured output
+dspy.configure(lm=lm, adapter=dspy.TwoStepAdapter()) # Reasoning then output
+```
+
+---
+
+## Retrievers
+
+```python
+# ColBERTv2 (remote server)
+colbertv2 = dspy.ColBERTv2(url='http://server:2017/wiki17_abstracts')
+dspy.configure(rm=colbertv2)
+retrieve = dspy.Retrieve(k=3)
+results = retrieve(query="...")
+print(results.passages)
+
+# Embedding-based retrieval
+from dspy.retrievers.embeddings import Embeddings
+retriever = Embeddings(embedder=embedder, corpus=docs, k=3)
+```
+
+---
+
+## Assertions (Deprecated → use BestOfN/Refine)
+
+```python
+class MyModule(dspy.Module):
+    def forward(self, text):
+        pred = self.predict(text=text)
+        dspy.Suggest(len(pred.summary.split()) < 100, "Keep summary under 100 words")
+        return pred
+
+module = MyModule().activate_assertions()
+```
+
+---
+
+## Streaming
+
+```python
+import dspy
+import asyncio
+
+stream_module = dspy.streamify(
+    program,
+    stream_listeners=[dspy.streaming.StreamListener(signature_field_name="answer")]
+)
+
+async def run():
+    async for chunk in stream_module(question="..."):
+        if isinstance(chunk, dspy.streaming.StreamResponse):
+            print(chunk.chunk, end="", flush=True)
+        elif isinstance(chunk, dspy.Prediction):
+            return chunk
+
+result = asyncio.run(run())
+```
+
+---
+
+## Async
+
+```python
+# All modules have acall()
+result = await module.acall(question="...")
+
+# Custom async modules
+class MyModule(dspy.Module):
+    async def aforward(self, question, **kwargs):
+        r1 = await self.step1.acall(question=question)
+        return await self.step2.acall(answer=r1.answer)
+
+# Async-to-sync bridge
+with dspy.context(allow_tool_async_sync_conversion=True):
+    result = async_tool(param="value")
+```
+
+---
+
+## Data Handling
+
+### Built-in Datasets
+```python
+from dspy.datasets import HotPotQA, GSM8k
+dataset = HotPotQA(train_seed=1, train_size=20, dev_size=50)
+trainset = dataset.train  # list[dspy.Example]
+devset = dataset.dev
+```
+
+### Custom Data
+```python
+import pandas as pd
+df = pd.read_csv("data.csv")
+dataset = [
+    dspy.Example(**row).with_inputs("question")
+    for row in df.to_dict("records")
+]
+```
+
+---
+
+## MCP Integration
+
+```python
+pip install "dspy[mcp]"
+```
+
+```python
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+async with streamablehttp_client("http://localhost:8000/mcp") as (r, w):
+    async with ClientSession(r, w) as session:
+        await session.initialize()
+        tools = [dspy.Tool.from_mcp_tool(session, t)
+                 for t in (await session.list_tools()).tools]
+        react = dspy.ReAct("task -> result", tools=tools)
+        result = await react.acall(task="...")
+```
+
+---
+
+## Utilities
+
+```python
+dspy.inspect_history(n=3)               # Print last n LM calls
+dspy.configure_cache(enable_disk_cache=True)
+dspy.enable_logging() / dspy.disable_logging()
+dspy.asyncify(module)                   # Sync → async wrapper
+dspy.syncify(module)                    # Async → sync wrapper
+dspy.streamify(module, stream_listeners=[...])  # Enable streaming
+
+# Save / Load
+program.save("path.json")
+program.load("path.json")
+program = dspy.load("path.json")
+```
+
+---
+
+## Project Structure
+
+```
+dspy/
+├── __init__.py          # Public API exports
+├── adapters/            # ChatAdapter, JSONAdapter, TwoStepAdapter
+├── clients/             # LM client (uses LiteLLM), Embedder
+├── datasets/            # HotPotQA, GSM8k, built-in datasets
+├── evaluate/            # Evaluate class, built-in metrics
+├── predict/             # Predict, ChainOfThought, ReAct, ProgramOfThought,
+│                        # MultiChainComparison, BestOfN, Refine, CodeAct, RLM
+├── primitives/          # Module, Example, Prediction, Image, Audio, History, Tool
+├── retrievers/          # ColBERTv2, Embeddings, WeaviateRM, DatabricksRM
+├── signatures/          # Signature, InputField, OutputField
+├── streaming/           # streamify, StreamListener, StatusMessageProvider
+├── teleprompt/          # All optimizers: MIPROv2, BootstrapFewShot, COPRO, etc.
+└── utils/               # logging, caching, asyncify, syncify, saving
+```
+
+---
+
+## Complete Example: Optimized RAG
+
+```python
+import dspy
+
+# 1. Configure
+dspy.configure(lm=dspy.LM("openai/gpt-4o-mini"))
+
+# 2. Set up retrieval
+colbert = dspy.ColBERTv2(url="http://20.102.90.50:2017/wiki17_abstracts")
+dspy.configure(rm=colbert)
+
+# 3. Define program
+class RAG(dspy.Module):
+    def __init__(self, k=3):
+        self.retrieve = dspy.Retrieve(k=k)
+        self.generate = dspy.ChainOfThought("context, question -> answer")
+
+    def forward(self, question):
+        context = self.retrieve(question).passages
+        return self.generate(context=context, question=question)
+
+# 4. Define metric and data
+def metric(example, pred, trace=None):
+    return dspy.evaluate.answer_exact_match(example, pred)
+
+trainset = [dspy.Example(question=q, answer=a).with_inputs("question")
+            for q, a in train_data]
+devset = [dspy.Example(question=q, answer=a).with_inputs("question")
+          for q, a in dev_data]
+
+# 5. Optimize
+optimizer = dspy.MIPROv2(metric=metric, auto="medium")
+optimized_rag = optimizer.compile(RAG(), trainset=trainset, valset=devset)
+
+# 6. Evaluate
+evaluator = dspy.Evaluate(devset=devset, num_threads=4, display_progress=True)
+score = evaluator(optimized_rag, metric=metric)
+print(f"Score: {score}")
+
+# 7. Save and reuse
+optimized_rag.save("optimized_rag.json")
+
+# Later:
+rag = RAG()
+rag.load("optimized_rag.json")
+result = rag(question="What is colbert?")
+print(result.answer)
+```
+
+---
+
+## Module Selection Quick Reference
+
+| Task | Module |
+|---|---|
+| Simple LM call | `dspy.Predict` |
+| Step-by-step reasoning | `dspy.ChainOfThought` |
+| Tool-using agent | `dspy.ReAct` |
+| Code-based computation | `dspy.ProgramOfThought` |
+| Code + custom tools | `dspy.CodeAct` |
+| Ensemble / vote | `dspy.MultiChainComparison` / `dspy.Parallel` |
+| Quality constraint | `dspy.BestOfN` |
+| Iterative refinement | `dspy.Refine` |
+| Very large contexts | `dspy.RLM` (experimental) |
